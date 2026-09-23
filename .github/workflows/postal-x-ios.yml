@@ -1,4 +1,4 @@
-name: Postal X iOS v3 - fix AssetRipper Linux x64
+name: Postal X iOS v4 - fix Unity install directory
 
 on:
   workflow_dispatch:
@@ -305,7 +305,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v3-Recovery-Diagnostics-and-Original-Icon
+          name: Postal-X-v4-Recovery-Diagnostics-and-Original-Icon
           path: output/
           if-no-files-found: warn
           retention-days: 7
@@ -313,7 +313,7 @@ jobs:
       - name: Upload reconstructed project (not guaranteed playable)
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v3-Recovered-Unity-EXPERIMENTAL
+          name: Postal-X-v4-Recovered-Unity-EXPERIMENTAL
           path: postalx-recovered.tar.gz
           if-no-files-found: error
           retention-days: 2
@@ -337,7 +337,7 @@ jobs:
       - name: Retrieve recovered Unity project
         uses: actions/download-artifact@v4
         with:
-          name: Postal-X-v3-Recovered-Unity-EXPERIMENTAL
+          name: Postal-X-v4-Recovered-Unity-EXPERIMENTAL
           path: recovered
       - name: Extract project and prepare diagnostics
         shell: bash
@@ -370,7 +370,12 @@ jobs:
           export UNITY_NON_INTERACTIVE=1
           export UNITY_NO_CONSENT_PROMPT=1
           export UNITY_NO_UPDATE_CHECK=1
-          mkdir -p "$UNITY_CLI_HOME"
+          # Unity CLI requires the editor install directory to ALREADY exist.
+          # v3 failed at editors install-path --set because this path was missing.
+          UNITY_EDITOR_ROOT="$HOME/UnityEditors"
+          mkdir -p "$UNITY_CLI_HOME" "$UNITY_EDITOR_ROOT" output
+          test -d "$UNITY_EDITOR_ROOT"
+          echo "Unity editor destination: $UNITY_EDITOR_ROOT"
           curl -fsSL --retry 4 \
             https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
             -o /tmp/unity-install.sh
@@ -378,19 +383,25 @@ jobs:
           UNITY="$UNITY_CLI_HOME/bin/unity"
           test -x "$UNITY"
           "$UNITY" --non-interactive --no-banner --no-color \
-            editors install-path --set "$HOME/UnityEditors"
+            editors install-path --set "$UNITY_EDITOR_ROOT"
+          "$UNITY" --non-interactive --no-banner --no-color \
+            editors install-path | tee output/unity-editor-path.txt
           "$UNITY" --non-interactive --no-banner --no-color \
             install 6000.2.7f2 --changeset 2b518236b676 \
             --module ios --no-child-modules --yes --accept-eula \
             2>&1 | tee output/unity-install.log
-          UNITY_BIN="$(find "$HOME/UnityEditors" -type f \
+          UNITY_BIN="$(find "$UNITY_EDITOR_ROOT" -type f \
             -path '*/Unity.app/Contents/MacOS/Unity' -print -quit)"
-          test -x "$UNITY_BIN"
+          if [ -z "$UNITY_BIN" ] || [ ! -x "$UNITY_BIN" ]; then
+            echo 'Unity editor not found after install. Check unity-install.log.' >&2
+            find "$UNITY_EDITOR_ROOT" -maxdepth 7 -print | head -100 || true
+            exit 1
+          fi
           echo "$UNITY_BIN" > output/unity-bin.txt
       - name: Export experimental Unity iOS Xcode project
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           "$(cat output/unity-bin.txt)" \
             -batchmode -nographics -quit \
             -projectPath "$PWD/reconstructed-project" \
@@ -431,7 +442,7 @@ jobs:
       - name: Compile iPhone arm64 app with Xcode
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           PROJECT="$PWD/build/PostalX-iOS/Unity-iPhone.xcodeproj"
           test -d "$PROJECT"
           xcodebuild -project "$PROJECT" \
@@ -461,13 +472,13 @@ jobs:
             Payload/PostalX.app/Info.plist || true
           rm -rf Payload/PostalX.app/_CodeSignature
           rm -f Payload/PostalX.app/embedded.mobileprovision
-          zip -qry Postal-X-iOS-v2-EXPERIMENTAL-UNSIGNED.ipa Payload
-          ls -lh Postal-X-iOS-v2-EXPERIMENTAL-UNSIGNED.ipa
+          zip -qry Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa Payload
+          ls -lh Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa
       - name: Upload experimental IPA (NOT verified playable)
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-iOS-v2-EXPERIMENTAL-UNSIGNED
-          path: Postal-X-iOS-v2-EXPERIMENTAL-UNSIGNED.ipa
+          name: Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED
+          path: Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa
           retention-days: 7
           if-no-files-found: error
       - name: Return Unity Personal license
@@ -477,7 +488,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v3-iOS-Build-Logs
+          name: Postal-X-v4-iOS-Build-Logs
           path: output/
           if-no-files-found: ignore
           retention-days: 7
