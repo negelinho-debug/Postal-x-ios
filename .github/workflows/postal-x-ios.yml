@@ -1,0 +1,176 @@
+name: Postal X iOS - original icon and native build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-apk:
+    name: Extract original Postal X icon and game data
+    runs-on: ubuntu-latest
+    outputs:
+      has_ios_export: ${{ steps.check.outputs.has_ios_export }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find iOS Xcode export
+        id: check
+        shell: bash
+        run: |
+          if [ -d ios-export/Unity-iPhone.xcodeproj ]; then
+            echo 'has_ios_export=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_ios_export=false' >> "$GITHUB_OUTPUT"
+            echo 'No ios-export/Unity-iPhone.xcodeproj yet; this APK alone cannot build an iOS game.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download PostalX_ANDROID.apk from this repository's Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          if [ -f input/PostalX_ANDROID.apk ]; then
+            echo 'Using APK already present in input/'
+          else
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
+              gh release download "$tag" --pattern 'PostalX_ANDROID.apk' --dir input --clobber && break || true
+            done < <(gh release list --limit 30 --json tagName --jq '.[].tagName')
+          fi
+          if [ ! -f input/PostalX_ANDROID.apk ]; then
+            echo 'ERROR: First attach PostalX_ANDROID.apk to a GitHub Release in this repository.' >&2
+            exit 1
+          fi
+          ls -lh input/PostalX_ANDROID.apk
+
+      - name: Verify Unity IL2CPP and extract the ORIGINAL Android launcher icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p postal-x-assets
+          python3 - <<'PY'
+          import zipfile, pathlib
+          apk = pathlib.Path('input/PostalX_ANDROID.apk')
+          out = pathlib.Path('postal-x-assets')
+          with zipfile.ZipFile(apk) as z:
+              required = [
+                  'lib/arm64-v8a/libil2cpp.so',
+                  'lib/arm64-v8a/libunity.so',
+                  'assets/bin/Data/Managed/Metadata/global-metadata.dat',
+                  'res/oj.png',
+              ]
+              for name in required:
+                  if name not in z.namelist():
+                      raise SystemExit('Not the inspected Postal X APK: missing ' + name)
+              # APK manifest references 0x7f0f0001 (app_icon). Its xxhdpi
+              # 192x192 bitmap is res/oj.png in THIS EXACT APK.
+              (out / 'PostalX-original-icon.png').write_bytes(z.read('res/oj.png'))
+              (out / 'Unity-Android-metadata.dat').write_bytes(
+                  z.read('assets/bin/Data/Managed/Metadata/global-metadata.dat')
+              )
+              (out / 'README.txt').write_text(
+                  'Postal X Android APK: Unity IL2CPP.\n'
+                  'Original launcher icon extracted from res/oj.png.\n'
+                  'Android .so binaries cannot run on iOS.\n'
+                  'A Unity iOS Xcode export built from the ORIGINAL game project\n'
+                  'is required to create a playable iOS IPA.\n',
+                  encoding='utf-8'
+              )
+              print('Extracted original launcher icon and metadata.')
+          PY
+
+      - name: Upload original launcher icon and inspection report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-X-Original-Icon-and-Report
+          path: postal-x-assets/
+          retention-days: 30
+
+  build-ios:
+    name: Compile native Postal X iPhone IPA (only with Unity iOS export)
+    needs: inspect-apk
+    if: needs.inspect-apk.outputs.has_ios_export == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository with iOS export
+        uses: actions/checkout@v4
+
+      - name: Retrieve verified original Postal X launcher icon
+        uses: actions/download-artifact@v4
+        with:
+          name: Postal-X-Original-Icon-and-Report
+          path: postal-x-assets/
+
+      - name: Compile genuine Unity iOS export for arm64 iPhone
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d ios-export/Unity-iPhone.xcodeproj
+          xcodebuild \
+            -project ios-export/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Put original Postal X icon on the compiled iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP"
+          test -f "$APP/Info.plist"
+          test -f postal-x-assets/PostalX-original-icon.png
+
+          mkdir -p Payload/PostalX.app
+          cp -a "$APP"/. Payload/PostalX.app/
+          APP=Payload/PostalX.app
+          ICON=postal-x-assets/PostalX-original-icon.png
+          sips -z 120 120 "$ICON" --out "$APP/Icon-60@2x.png" >/dev/null
+          sips -z 180 180 "$ICON" --out "$APP/Icon-60@3x.png" >/dev/null
+          sips -z 152 152 "$ICON" --out "$APP/Icon-76@2x.png" >/dev/null
+          sips -z 167 167 "$ICON" --out "$APP/Icon-83.5@2x.png" >/dev/null
+
+          PLIST="$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Delete :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' "$PLIST" || true
+          /usr/libexec/PlistBuddy -c 'Delete :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles' "$PLIST" || true
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleIcons dict' "$PLIST" || true
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleIcons:CFBundlePrimaryIcon dict' "$PLIST" || true
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles array' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0 string Icon-60' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string Postal X' "$PLIST" || \
+            /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Postal X' "$PLIST"
+
+          rm -rf "$APP/_CodeSignature"
+          rm -f "$APP/embedded.mobileprovision"
+          /usr/bin/zip -qry Postal-X-iOS-UNSIGNED.ipa Payload
+          ls -lh Postal-X-iOS-UNSIGNED.ipa
+
+      - name: Upload unsigned native iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-X-iOS-UNSIGNED
+          path: Postal-X-iOS-UNSIGNED.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save build log if compilation fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-X-iOS-Build-Logs
+          path: xcodebuild.log
+          if-no-files-found: ignore
