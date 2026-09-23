@@ -1,13 +1,7 @@
-name: Postal X iOS v4 - fix Unity install directory
+name: Postal X iOS v5 - full APK IL2CPP recovery check
 
 on:
   workflow_dispatch:
-    inputs:
-      force_experimental_build:
-        description: "Attempt iOS export even if recovered gameplay scripts are incomplete (may NOT be playable)"
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -15,12 +9,9 @@ permissions:
 
 jobs:
   recover:
-    name: 1. Recover original Postal X Unity assets
+    name: Recover Postal X IL2CPP scripts from FULL APK
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    outputs:
-      game_code_ready: ${{ steps.audit.outputs.game_code_ready }}
-      scenes_found: ${{ steps.audit.outputs.scenes_found }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -172,12 +163,12 @@ jobs:
           echo "$RIPPER" > output/assetripper-path.txt
           echo "Selected Linux x64 binary: $RIPPER"
 
-      - name: Recover Unity project with AssetRipper
+      - name: Load the COMPLETE Android game in AssetRipper
         shell: bash
         run: |
           set -euo pipefail
           RIPPER="$(cat output/assetripper-path.txt)"
-          INPUT="$PWD/work/apk/assets/bin/Data"
+          INPUT="$PWD/work/apk"  # Contains assets + lib/arm64-v8a/libil2cpp.so + metadata
           EXPORT="$PWD/recovered/PostalX"
           mkdir -p "$EXPORT"
           "$RIPPER" --headless --port 3333 > output/assetripper.log 2>&1 &
@@ -190,305 +181,183 @@ jobs:
               break
             fi
             if ! kill -0 "$PID" 2>/dev/null; then
-              echo 'AssetRipper process exited before its web server became ready.' >&2
-              tail -150 output/assetripper.log
+              echo 'AssetRipper exited unexpectedly.' >&2
+              tail -100 output/assetripper.log || true
               exit 1
             fi
             sleep 1
           done
-          if [ "$READY" -ne 1 ]; then
-            echo 'AssetRipper did not start within 90 seconds.' >&2
-            tail -150 output/assetripper.log
-            exit 1
-          fi
-          curl -fsS -L --max-time 3600 \
+          test "$READY" = 1 || { echo 'AssetRipper web server did not start.'; exit 1; }
+          echo "Loading the FULL extracted APK: $INPUT"
+          echo 'Checking that original native code and metadata are available:'
+          ls -lh "$INPUT/lib/arm64-v8a/libil2cpp.so" \
+                 "$INPUT/assets/bin/Data/Managed/Metadata/global-metadata.dat"
+
+          # v4 used only the Data/ folder, hiding libil2cpp.so from AssetRipper.
+          # v5 loads the entire extracted APK including its native IL2CPP binary.
+          curl -fsS -L --retry 2 --max-time 3600 \
             -H 'Content-Type: application/x-www-form-urlencoded' \
             --data-urlencode "Path=$INPUT" \
             http://127.0.0.1:3333/LoadFolder \
-            -o output/load-response.html
+            -o output/load-full-apk-response.html
+
           curl -fsS -L --max-time 3600 \
             -H 'Content-Type: application/x-www-form-urlencoded' \
             --data-urlencode "Path=$EXPORT" \
             --data-urlencode 'CreateSubfolder=false' \
             http://127.0.0.1:3333/Export/UnityProject \
             -o output/export-response.html
+
           PROJECT="$(find "$EXPORT" -type d -name Assets -print -quit \
             | xargs -r dirname)"
-          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
-            echo 'AssetRipper did not create a Unity project; review diagnostic logs.' >&2
+          test -n "$PROJECT" && test -d "$PROJECT/Assets" || {
+            echo 'AssetRipper did not produce a Unity project.' >&2
+            tail -150 output/assetripper.log
             exit 1
-          fi
+          }
           echo "$PROJECT" > output/project-path.txt
-          echo "Reconstructed project: $PROJECT"
+          echo "Project: $PROJECT"
 
-      - name: Audit recovered project for scenes and game code
-        id: audit
+      - name: Audit REAL game scripts (fix v4 false 0-stubs result)
         shell: bash
         run: |
           set -euo pipefail
           PROJECT="$(cat output/project-path.txt)"
-          SCENES="$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l | tr -d ' ')"
-          SCRIPTS="$(find "$PROJECT/Assets" -type f -name '*.cs' ! -path '*/Editor/*' | wc -l | tr -d ' ')"
-          STUBS="$( (grep -rlE 'NotImplementedException|DummyDll|throw new System.NotImplementedException' \
-            "$PROJECT/Assets" --include='*.cs' 2>/dev/null || true) | wc -l | tr -d ' ')"
-          printf 'Unity: 6000.2.7f2\nScenes: %s\nExported C# files: %s\nLikely stubs: %s\n' \
-            "$SCENES" "$SCRIPTS" "$STUBS" | tee output/recovery-audit.txt
-          echo "scenes_found=$([ "$SCENES" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          # With Android IL2CPP there is no reliable way to prove recovered
-          # C# contains original gameplay. Default to NOT treating it as ready.
-          echo 'game_code_ready=false' >> "$GITHUB_OUTPUT"
-          echo '### Postal X recovery' >> "$GITHUB_STEP_SUMMARY"
-          cat output/recovery-audit.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '⚠️ Recovered Unity assets are NOT proof the original IL2CPP game code was restored.' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Add the ORIGINAL icon and iOS build script
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROJECT="$(cat output/project-path.txt)"
-          mkdir -p "$PROJECT/Assets/Editor" "$PROJECT/ProjectSettings"
-          cp output/PostalX-original-icon.png "$PROJECT/Assets/PostalX-original-icon.png"
-          printf 'm_EditorVersion: 6000.2.7f2\n' > "$PROJECT/ProjectSettings/ProjectVersion.txt"
-          # Exclude Android native libraries. iOS cannot load .so/.aar/.jar.
-          find "$PROJECT/Assets" -type f \
-            \( -iname '*.so' -o -iname '*.aar' -o -iname '*.jar' \) -delete
-          rm -rf "$PROJECT/Assets/Plugins/Android" "$PROJECT/Library"
-          cat > "$PROJECT/Assets/Editor/PostalXIOSBuild.cs" <<'CS'
-          using System;
-          using System.IO;
-          using System.Linq;
-          using UnityEditor;
-          using UnityEditor.Build;
-          using UnityEditor.Build.Reporting;
-          using UnityEngine;
-
-          public static class PostalXIOSBuild
-          {
-              public static void Build()
-              {
-                  string[] scenes = AssetDatabase.FindAssets("t:Scene", new [] {"Assets"})
-                      .Select(AssetDatabase.GUIDToAssetPath)
-                      .Where(s => !string.IsNullOrEmpty(s) && s.EndsWith(".unity"))
-                      .Distinct().OrderBy(s => s).ToArray();
-                  if (scenes.Length == 0)
-                      throw new Exception("No Unity scenes recovered from APK");
-                  EditorBuildSettings.scenes = scenes
-                      .Select(s => new EditorBuildSettingsScene(s, true)).ToArray();
-                  PlayerSettings.SetScriptingBackend(NamedBuildTarget.iOS,
-                      ScriptingImplementation.IL2CPP);
-                  PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.iOS,
-                      "com.zhenia.postalx.ios");
-                  PlayerSettings.iOS.targetOSVersionString = "15.0";
-                  string output = Path.GetFullPath(
-                      Path.Combine(Application.dataPath, "../../build/PostalX-iOS"));
-                  var options = new BuildPlayerOptions {
-                      scenes = scenes, locationPathName = output,
-                      target = BuildTarget.iOS,
-                      options = BuildOptions.None
-                  };
-                  var result = BuildPipeline.BuildPlayer(options);
-                  if (result.summary.result != BuildResult.Succeeded)
-                      throw new Exception("Unity export failed: " + result.summary.result);
-              }
-          }
-          CS
-
-      - name: Archive recovered project
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROJECT="$(cat output/project-path.txt)"
-          tar -czf postalx-recovered.tar.gz -C "$PROJECT" .
-          ls -lh postalx-recovered.tar.gz
-
-      - name: Upload original icon and project diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Postal-X-v4-Recovery-Diagnostics-and-Original-Icon
-          path: output/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload reconstructed project (not guaranteed playable)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Postal-X-v4-Recovered-Unity-EXPERIMENTAL
-          path: postalx-recovered.tar.gz
-          if-no-files-found: error
-          retention-days: 2
-          compression-level: 0
-
-  experimental_ios:
-    name: 2. EXPERIMENTAL Unity iOS export - not verified playable
-    needs: recover
-    if: >-
-      ${{ needs.recover.outputs.scenes_found == 'true' &&
-          (needs.recover.outputs.game_code_ready == 'true' ||
-           inputs.force_experimental_build == true) }}
-    runs-on: macos-latest
-    timeout-minutes: 180
-    env:
-      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
-      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Retrieve recovered Unity project
-        uses: actions/download-artifact@v4
-        with:
-          name: Postal-X-v4-Recovered-Unity-EXPERIMENTAL
-          path: recovered
-      - name: Extract project and prepare diagnostics
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p reconstructed-project output
-          tar -xzf recovered/postalx-recovered.tar.gz -C reconstructed-project
-          test -d reconstructed-project/Assets
-          echo 'WARNING: Experimental build from reconstructed assets.' | tee output/READ_ME_FIRST.txt
-          echo 'The APK used IL2CPP. This build may contain no original gameplay code.' \
-            | tee -a output/READ_ME_FIRST.txt
-      - name: Install Unity Hub and CLI
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Activate Unity Personal and install Unity 6 iOS support
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$UNITY_EMAIL" && test -n "$UNITY_PASSWORD" || {
-            echo 'Set UNITY_USERNAME and UNITY_PASSWORD as GitHub repository secrets.' >&2
-            exit 1
-          }
-          npm install -g @rage-against-the-pixel/unity-cli
-          unity-cli hub-install --json
-          unity-cli activate-license --license personal \
-            --email "$UNITY_EMAIL" --password "$UNITY_PASSWORD" --json
-          export UNITY_CLI_HOME="$PWD/tools/unity-cli"
-          export UNITY_CLI_CHANNEL=beta
-          export UNITY_NON_INTERACTIVE=1
-          export UNITY_NO_CONSENT_PROMPT=1
-          export UNITY_NO_UPDATE_CHECK=1
-          # Unity CLI requires the editor install directory to ALREADY exist.
-          # v3 failed at editors install-path --set because this path was missing.
-          UNITY_EDITOR_ROOT="$HOME/UnityEditors"
-          mkdir -p "$UNITY_CLI_HOME" "$UNITY_EDITOR_ROOT" output
-          test -d "$UNITY_EDITOR_ROOT"
-          echo "Unity editor destination: $UNITY_EDITOR_ROOT"
-          curl -fsSL --retry 4 \
-            https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
-            -o /tmp/unity-install.sh
-          bash /tmp/unity-install.sh
-          UNITY="$UNITY_CLI_HOME/bin/unity"
-          test -x "$UNITY"
-          "$UNITY" --non-interactive --no-banner --no-color \
-            editors install-path --set "$UNITY_EDITOR_ROOT"
-          "$UNITY" --non-interactive --no-banner --no-color \
-            editors install-path | tee output/unity-editor-path.txt
-          "$UNITY" --non-interactive --no-banner --no-color \
-            install 6000.2.7f2 --changeset 2b518236b676 \
-            --module ios --no-child-modules --yes --accept-eula \
-            2>&1 | tee output/unity-install.log
-          UNITY_BIN="$(find "$UNITY_EDITOR_ROOT" -type f \
-            -path '*/Unity.app/Contents/MacOS/Unity' -print -quit)"
-          if [ -z "$UNITY_BIN" ] || [ ! -x "$UNITY_BIN" ]; then
-            echo 'Unity editor not found after install. Check unity-install.log.' >&2
-            find "$UNITY_EDITOR_ROOT" -maxdepth 7 -print | head -100 || true
-            exit 1
-          fi
-          echo "$UNITY_BIN" > output/unity-bin.txt
-      - name: Export experimental Unity iOS Xcode project
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$(cat output/unity-bin.txt)" \
-            -batchmode -nographics -quit \
-            -projectPath "$PWD/reconstructed-project" \
-            -buildTarget iOS \
-            -executeMethod PostalXIOSBuild.Build \
-            -logFile - 2>&1 | tee output/unity-export.log
-      - name: Apply ORIGINAL Postal X icon to Unity Xcode asset catalog
-        shell: bash
-        run: |
-          set -euo pipefail
-          ICON="$PWD/reconstructed-project/Assets/PostalX-original-icon.png"
-          test -s "$ICON"
-          CATALOG="$(find build/PostalX-iOS -type d -name AppIcon.appiconset -print -quit)"
-          if [ -n "$CATALOG" ]; then
-            python3 - "$CATALOG" <<'PYICON'
+          python3 - "$PROJECT" <<'PY'
+          import sys
           from pathlib import Path
-          import json,sys
-          catalog=Path(sys.argv[1])
-          images=[
-             {'idiom':'iphone','size':'60x60','scale':'2x','filename':'Icon120.png'},
-             {'idiom':'iphone','size':'60x60','scale':'3x','filename':'Icon180.png'},
-             {'idiom':'ipad','size':'76x76','scale':'2x','filename':'Icon152.png'},
-             {'idiom':'ipad','size':'83.5x83.5','scale':'2x','filename':'Icon167.png'},
-             {'idiom':'universal','platform':'ios','size':'1024x1024','filename':'Icon1024.png'},
-          ]
-          (catalog/'Contents.json').write_text(
-              json.dumps({'images':images,'info':{'author':'xcode','version':1}},indent=2))
-          PYICON
-            for n in 120 180 152 167 1024; do
-              sips -z "$n" "$n" "$ICON" \
-                --out "$CATALOG/Icon${n}.png" >/dev/null
-            done
-            echo "Applied original Android launcher artwork to $CATALOG"
+          project = Path(sys.argv[1]); assets = project/'Assets'
+          scenes = list(assets.rglob('*.unity'))
+          scripts = list(assets.rglob('*.cs'))
+          # Unlike v4, this detects AssetRipper's actual marker "Dummy class."
+          gameplay = [p for p in scripts
+                      if '/Assembly-CSharp/' in '/' + p.as_posix()]
+          dummy = []
+          not_dummy = []
+          for p in gameplay:
+              data = p.read_text(encoding='utf-8', errors='replace')
+              if any(token in data for token in (
+                    'Dummy class.', 'NotImplementedException',
+                    'Generated using dummy', 'generated dummy class')):
+                  dummy.append(p)
+              else:
+                  not_dummy.append(p)
+          report = ('Unity 6000.2.7f2\n'
+                    f'Scenes: {len(scenes)}\n'
+                    f'All C# files (including Unity packages): {len(scripts)}\n'
+                    f'Assembly-CSharp gameplay classes: {len(gameplay)}\n'
+                    f'Gameplay dummy scripts: {len(dummy)}\n'
+                    f'Gameplay without dummy marker: {len(not_dummy)}\n'
+                    '\nNOTE: No dummy marker does NOT prove the game works.\n')
+          Path('output/real-game-code-audit.txt').write_text(report)
+          Path('output/dummy-files.txt').write_text('\n'.join(str(p) for p in dummy)+'\n')
+          Path('output/non-dummy-files.txt').write_text(
+              '\n'.join(str(p) for p in not_dummy)+'\n')
+          print(report)
+          with open(Path.cwd()/ 'output' / 'code-example.txt','w') as f:
+              for p in not_dummy[:5]:
+                  f.write(f'===== {p} =====\n')
+                  f.write(p.read_text(encoding='utf-8',errors='replace')[:2500]+'\n')
+          with open(Path.cwd()/ 'output' / 'code-example.txt','a') as f:
+              if not not_dummy:
+                  f.write('No non-dummy Assembly-CSharp files were recovered.\n')
+          with open(Path.cwd()/ 'output' / 'overview.txt','w') as f:
+              f.write(report)
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('### Postal X FULL APK audit\n\n```text\n'+report+'```\n')
+          PY
+
+      - name: Check native IL2CPP with Cpp2IL (independent experiment)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        timeout-minutes: 45
+        run: |
+          set -uo pipefail
+          mkdir -p tools/cpp2il output/cpp2il-out
+          # Official Cpp2IL native Linux release: no SDK or Unity account required.
+          # Prefer recent published release with an x64 Linux archive.
+          gh api 'repos/SamboyCoding/Cpp2IL/releases?per_page=30' \
+            > output/cpp2il-releases.json || exit 0
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          releases = json.loads(Path('output/cpp2il-releases.json').read_text())
+          for release in releases:
+              for a in release.get('assets', []):
+                  name = a.get('name','').lower()
+                  if ('linux' in name and 'arm' not in name
+                          and (name.endswith('.zip') or name.endswith('.tar.gz'))):
+                      Path('output/cpp2il-release-tag.txt').write_text(release['tag_name'])
+                      Path('output/cpp2il-asset.txt').write_text(a['name'])
+                      print('Cpp2IL:', release['tag_name'], a['name'])
+                      raise SystemExit(0)
+          raise SystemExit('No official Linux x64 release archive found')
+          PY
+          TAG="$(cat output/cpp2il-release-tag.txt)"
+          ASSET="$(cat output/cpp2il-asset.txt)"
+          gh release download "$TAG" -R SamboyCoding/Cpp2IL \
+            --pattern "$ASSET" -D tools --clobber || exit 0
+          case "$ASSET" in
+            *.zip) unzip -q "tools/$ASSET" -d tools/cpp2il ;;
+            *.tar.gz) tar -xzf "tools/$ASSET" -C tools/cpp2il ;;
+          esac
+          BIN="$(find tools/cpp2il -type f \( -name Cpp2IL -o -name CPP2IL \) \
+            -print -quit)"
+          test -n "$BIN" || { echo 'Cpp2IL executable missing' | tee output/cpp2il.log; exit 0; }
+          chmod +x "$BIN"
+          "$BIN" --list-output-formats > output/cpp2il-formats.txt 2>&1 || true
+          if grep -q 'dll_il_recovery' output/cpp2il-formats.txt; then
+            FORMAT=dll_il_recovery
+          elif grep -q 'dummydll' output/cpp2il-formats.txt; then
+            FORMAT=dummydll
           else
-            echo 'No AppIcon.appiconset found in exported Xcode project.'
-            echo 'The original PNG will still be included in the app bundle.'
+            echo 'No supported Cpp2IL output format' | tee output/cpp2il.log
+            exit 0
           fi
-      - name: Compile iPhone arm64 app with Xcode
+          echo "Using Cpp2IL format: $FORMAT" | tee output/cpp2il.log
+          "$BIN" --game-path "$PWD/input/PostalX_ANDROID.apk" \
+            --output-as "$FORMAT" --output-to "$PWD/output/cpp2il-out" \
+            >> output/cpp2il.log 2>&1 || true
+          find output/cpp2il-out -type f -printf '%p %s bytes\n' | head -60 \
+            > output/cpp2il-files.txt || true
+          # A dummydll result is metadata, NOT playable C# game code.
+          echo "CPP2IL FORMAT=$FORMAT" >> output/overview.txt
+
+      - name: Attach original icon to reconstructed project
         shell: bash
         run: |
           set -euo pipefail
-          PROJECT="$PWD/build/PostalX-iOS/Unity-iPhone.xcodeproj"
-          test -d "$PROJECT"
-          xcodebuild -project "$PROJECT" \
-            -scheme Unity-iPhone -configuration Release \
-            -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/DerivedData" \
-            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
-            build 2>&1 | tee output/xcodebuild.log
-      - name: Package IPA with Postal X original icon
+          PROJECT="$(cat output/project-path.txt)"
+          cp output/PostalX-original-icon.png "$PROJECT/Assets/PostalX-original-icon.png"
+          mkdir -p "$PROJECT/ProjectSettings"
+          printf 'm_EditorVersion: 6000.2.7f2\n' \
+            > "$PROJECT/ProjectSettings/ProjectVersion.txt"
+
+      - name: Archive recovery (diagnostic, NOT playable IPA)
         shell: bash
         run: |
           set -euo pipefail
-          APP="$(find DerivedData/Build/Products/Release-iphoneos \
-            -maxdepth 1 -type d -name '*.app' -print -quit)"
-          test -n "$APP"
-          mkdir -p Payload
-          cp -R "$APP" Payload/PostalX.app
-          ICON=reconstructed-project/Assets/PostalX-original-icon.png
-          test -s "$ICON"
-          # Include original artwork; actual installed icon also depends on
-          # the recovered project's compiled Unity asset catalog.
-          cp "$ICON" Payload/PostalX.app/PostalX-original-icon.png
-          sips -z 120 120 "$ICON" --out Payload/PostalX.app/Icon-60@2x.png >/dev/null
-          sips -z 180 180 "$ICON" --out Payload/PostalX.app/Icon-60@3x.png >/dev/null
-          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Postal X' \
-            Payload/PostalX.app/Info.plist || true
-          rm -rf Payload/PostalX.app/_CodeSignature
-          rm -f Payload/PostalX.app/embedded.mobileprovision
-          zip -qry Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa Payload
-          ls -lh Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa
-      - name: Upload experimental IPA (NOT verified playable)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED
-          path: Postal-X-iOS-v4-EXPERIMENTAL-UNSIGNED.ipa
-          retention-days: 7
-          if-no-files-found: error
-      - name: Return Unity Personal license
-        if: always()
-        run: unity-cli return-license --license personal || true
-      - name: Upload iOS build diagnostics
+          PROJECT="$(cat output/project-path.txt)"
+          tar -czf Postal-X-v5-Recovered-Unity.tar.gz -C "$PROJECT" .
+          ls -lh Postal-X-v5-Recovered-Unity.tar.gz
+
+      - name: Upload full APK recovery diagnostics and ORIGINAL icon
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v4-iOS-Build-Logs
+          name: Postal-X-v5-Full-APK-Diagnostics
           path: output/
-          if-no-files-found: ignore
           retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload recovered Unity project
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Postal-X-v5-Recovered-Unity
+          path: Postal-X-v5-Recovered-Unity.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
