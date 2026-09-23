@@ -1,4 +1,4 @@
-name: Postal X iOS v2 - Unity recovery and experimental build
+name: Postal X iOS v3 - fix AssetRipper Linux x64
 
 on:
   workflow_dispatch:
@@ -107,37 +107,70 @@ jobs:
           print('\n'.join(lines))
           PY
 
-      - name: Download AssetRipper 2.0.0 Linux package
+      - name: Download correct AssetRipper 2.0.0 for Linux x86_64
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p tools/assetripper
+
+          echo "Runner CPU: $(uname -m)"
+          test "$(uname -m)" = "x86_64" || {
+            echo 'This workflow requires the GitHub Ubuntu x86_64 runner.' >&2
+            exit 1
+          }
+
           gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
             --jq '.assets[].name' | tee output/assetripper-assets.txt
-          ASSET="$(grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+
+          # v2 accidentally matched ARM64 because its regex ended in "64".
+          # Pick ONLY the x64 archive, NEVER linux_arm64 or Windows/macOS.
+          ASSET="$(grep -Ei '^AssetRipper[_-]linux[_-]x64([_.-].*)?\.(tar\.xz|tar\.gz|tgz|zip)$' \
             output/assetripper-assets.txt | head -1 || true)"
           if [ -z "$ASSET" ]; then
-            echo 'Could not find a compatible AssetRipper release package.' >&2
+            echo 'ERROR: AssetRipper 2.0.0 Linux x64 release archive not found.' >&2
+            cat output/assetripper-assets.txt
             exit 1
           fi
+          printf '%s\n' "$ASSET" | tee output/selected-assetripper-archive.txt
           gh release download 2.0.0 -R AssetRipper/AssetRipper \
-            -p "$ASSET" -D tools
+            -p "$ASSET" -D tools --clobber
+          test -s "tools/$ASSET"
           case "$ASSET" in
             *.tar.xz) tar -xJf "tools/$ASSET" -C tools/assetripper ;;
-            *.zip) unzip -q "tools/$ASSET" -d tools/assetripper ;;
+            *.tar.gz|*.tgz) tar -xzf "tools/$ASSET" -C tools/assetripper ;;
+            *.zip) unzip -oq "tools/$ASSET" -d tools/assetripper ;;
+            *) echo "Unsupported AssetRipper archive: $ASSET" >&2; exit 1 ;;
           esac
+
           RIPPER="$(find tools/assetripper -type f \
             \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
-            | head -1 || true)"
-          if [ -z "$RIPPER" ]; then
-            echo 'AssetRipper executable was not found:' >&2
+            -print -quit)"
+          test -n "$RIPPER" && test -f "$RIPPER" || {
+            echo 'ERROR: AssetRipper executable was not found:' >&2
             find tools/assetripper -maxdepth 3 -type f | head -70
             exit 1
-          fi
+          }
+
           chmod +x "$RIPPER"
+          file "$RIPPER" | tee output/assetripper-file-type.txt
+          # Detect incompatible format BEFORE attempting to launch it.
+          python3 - "$RIPPER" <<'PY'
+          import struct, sys
+          from pathlib import Path
+          data = Path(sys.argv[1]).read_bytes()[:20]
+          if len(data) < 20 or data[:4] != b'\x7fELF':
+              raise SystemExit('ERROR: downloaded AssetRipper is not a Linux ELF binary')
+          elf_class = data[4]
+          endian = '<' if data[5] == 1 else '>'
+          machine = struct.unpack(endian+'H', data[18:20])[0]
+          print('ELF class:', elf_class, 'machine:', machine)
+          if elf_class != 2 or machine != 62:
+              raise SystemExit('ERROR: AssetRipper is not Linux x86_64 (EM_X86_64=62).')
+          PY
           echo "$RIPPER" > output/assetripper-path.txt
+          echo "Selected Linux x64 binary: $RIPPER"
 
       - name: Recover Unity project with AssetRipper
         shell: bash
@@ -150,14 +183,24 @@ jobs:
           "$RIPPER" --headless --port 3333 > output/assetripper.log 2>&1 &
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true' EXIT
+          READY=0
           for i in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:3333/ >/dev/null 2>&1; then break; fi
+            if curl -fsS http://127.0.0.1:3333/ >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
             if ! kill -0 "$PID" 2>/dev/null; then
+              echo 'AssetRipper process exited before its web server became ready.' >&2
               tail -150 output/assetripper.log
               exit 1
             fi
             sleep 1
           done
+          if [ "$READY" -ne 1 ]; then
+            echo 'AssetRipper did not start within 90 seconds.' >&2
+            tail -150 output/assetripper.log
+            exit 1
+          fi
           curl -fsS -L --max-time 3600 \
             -H 'Content-Type: application/x-www-form-urlencoded' \
             --data-urlencode "Path=$INPUT" \
@@ -262,7 +305,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v2-Recovery-Diagnostics-and-Original-Icon
+          name: Postal-X-v3-Recovery-Diagnostics-and-Original-Icon
           path: output/
           if-no-files-found: warn
           retention-days: 7
@@ -270,7 +313,7 @@ jobs:
       - name: Upload reconstructed project (not guaranteed playable)
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v2-Recovered-Unity-EXPERIMENTAL
+          name: Postal-X-v3-Recovered-Unity-EXPERIMENTAL
           path: postalx-recovered.tar.gz
           if-no-files-found: error
           retention-days: 2
@@ -294,7 +337,7 @@ jobs:
       - name: Retrieve recovered Unity project
         uses: actions/download-artifact@v4
         with:
-          name: Postal-X-v2-Recovered-Unity-EXPERIMENTAL
+          name: Postal-X-v3-Recovered-Unity-EXPERIMENTAL
           path: recovered
       - name: Extract project and prepare diagnostics
         shell: bash
@@ -434,7 +477,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Postal-X-v2-iOS-Build-Logs
+          name: Postal-X-v3-iOS-Build-Logs
           path: output/
           if-no-files-found: ignore
           retention-days: 7
